@@ -1,6 +1,7 @@
 // wwwroot/js/bingo.js
 
 let libsLoaded = false;
+let _videoTrack = null;
 
 async function loadScript(src){
   return new Promise((resolve, reject) => {
@@ -112,133 +113,158 @@ async function segmentAndOcr(canvasEl, rows, cols){
   const gridMat = cropFooterIfNeeded(warped, rows, cols);
   if (gridMat !== warped) warped.delete();
 
-  // Binarize (Otsu) for clearer digits
+  // ---- denoise + binarize ----
   const gray = new cv.Mat();
-cv.cvtColor(gridMat, gray, cv.COLOR_RGBA2GRAY);
-const den = new cv.Mat();
-cv.medianBlur(gray, den, 3);               // less blur than Gaussian, preserves edges
-const bw = new cv.Mat();
-cv.threshold(den, bw, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-gray.delete(); den.delete();
+  cv.cvtColor(gridMat, gray, cv.COLOR_RGBA2GRAY);
+  const den = new cv.Mat();
+  cv.medianBlur(gray, den, 3);
+  const bw = new cv.Mat();
+  cv.threshold(den, bw, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+  gray.delete(); den.delete();
 
-// ---- per-cell crop (bigger padding so grid lines never leak in) ----
-const cellW = Math.floor(bw.cols / cols);
-const cellH = Math.floor(bw.rows / rows);
-const padXf = (rows === 3 && cols === 9) ? 0.18 : 0.14;
-const padYf = (rows === 3 && cols === 9) ? 0.14 : 0.12;
+  // ---- remove grid lines (horizontal + vertical) ----
+  const kh = Math.max(3, Math.floor(bw.cols / 18)); // ~cell width/2 for 3x9
+  const kv = Math.max(3, Math.floor(bw.rows / 12)); // ~cell height/2 for 3x9
+  const kernelH = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kh, 1));
+  const kernelV = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, kv));
+  const horiz = new cv.Mat(), vert = new cv.Mat(), lines = new cv.Mat();
+  cv.morphologyEx(bw, horiz, cv.MORPH_OPEN, kernelH);
+  cv.morphologyEx(bw, vert, cv.MORPH_OPEN, kernelV);
+  cv.bitwise_or(horiz, vert, lines);
+  const clean = new cv.Mat();
+  cv.subtract(bw, lines, clean);
+  kernelH.delete(); kernelV.delete(); horiz.delete(); vert.delete(); lines.delete();
+  bw.delete();
 
-const images = [];
-for (let r=0; r<rows; r++){
-  const rowImgs = [];
-  for (let c=0; c<cols; c++){
-    const x = c * cellW, y = r * cellH;
-    const padX = Math.floor(cellW * padXf);
-    const padY = Math.floor(cellH * padYf);
+  // ---- per-cell crop (bigger padding; last row nudge for 3x9) ----
+  const cellW = Math.floor(clean.cols / cols);
+  const cellH = Math.floor(clean.rows / rows);
+  const padXf = (rows === 3 && cols === 9) ? 0.18 : 0.14;
+  const padYf = (rows === 3 && cols === 9) ? 0.14 : 0.12;
 
-    // nudge last row a little lower for 3×9 tickets
-    const extraY = (rows === 3 && cols === 9 && r === rows-1) ? Math.floor(padY * 0.5) : 0;
+  const images = [];
+  for (let r=0; r<rows; r++){
+    const rowImgs = [];
+    for (let c=0; c<cols; c++){
+      const x = c * cellW, y = r * cellH;
+      const padX = Math.floor(cellW * padXf);
+      const padY = Math.floor(cellH * padYf);
+      const extraY = (rows === 3 && cols === 9 && r === rows-1) ? Math.floor(padY * 0.5) : 0;
 
-    const rx = Math.max(0, x + padX);
-    const ry = Math.max(0, y + padY + extraY);
-    const rw = Math.max(1, Math.min(cellW - 2*padX, bw.cols - rx));
-    const rh = Math.max(1, Math.min(cellH - 2*padY - extraY, bw.rows - ry));
+      const rx = Math.max(0, x + padX);
+      const ry = Math.max(0, y + padY + extraY);
+      const rw = Math.max(1, Math.min(cellW - 2*padX, clean.cols - rx));
+      const rh = Math.max(1, Math.min(cellH - 2*padY - extraY, clean.rows - ry));
 
-    const digit = bw.roi(new cv.Rect(rx, ry, rw, rh));
+      const digit = clean.roi(new cv.Rect(rx, ry, rw, rh));
 
-    // upscale ROI to help OCR (camera often ~1–2 MP)
-    const scaled = new cv.Mat();
-    const target = 120; // px
-    const scaleW = target, scaleH = Math.round((target * rh) / rw);
-    cv.resize(digit, scaled, new cv.Size(scaleW, scaleH), 0, 0, cv.INTER_CUBIC);
+      // upscale ROI to help OCR
+      const scaled = new cv.Mat();
+      const target = 140;
+      const scaleW = target, scaleH = Math.round((target * rh) / rw);
+      cv.resize(digit, scaled, new cv.Size(scaleW, scaleH), 0, 0, cv.INTER_CUBIC);
 
-    const tmp = document.createElement('canvas');
-    cv.imshow(tmp, scaled);
-    rowImgs.push(tmp.toDataURL('image/png'));
+      const tmp = document.createElement('canvas');
+      cv.imshow(tmp, scaled);
+      rowImgs.push(tmp.toDataURL('image/png'));
 
-    digit.delete(); scaled.delete();
+      digit.delete(); scaled.delete();
+    }
+    images.push(rowImgs);
   }
-  images.push(rowImgs);
-}
-bw.delete(); gridMat.delete();
 
-// ---- OCR with numeric mode + single line psm ----
-const worker = await Tesseract.createWorker('eng');
-await worker.setParameters({
-  tessedit_char_whitelist: '0123456789',
-  classify_bln_numeric_mode: '1',
-  tessedit_pageseg_mode: '7' // treat ROI as a single text line
-});
+  clean.delete();
+  gridMat.delete();
 
-const results = [];
-for (let r=0; r<rows; r++){
-  const row = [];
-  for (let c=0; c<cols; c++){
-    const { data } = await worker.recognize(images[r][c]);
-    const txt = (data.text || '').replace(/[^0-9]/g, '');
-    row.push(txt ? parseInt(txt, 10) : null);
+  // ---- OCR (numeric mode + single line) ----
+  const worker = await Tesseract.createWorker('eng');
+  await worker.setParameters({
+    tessedit_char_whitelist: '0123456789',
+    classify_bln_numeric_mode: '1',
+    tessedit_pageseg_mode: '7'
+  });
+
+  const results = [];
+  for (let r=0; r<rows; r++){
+    const row = [];
+    for (let c=0; c<cols; c++){
+      const { data } = await worker.recognize(images[r][c]);
+      const txt = (data.text || '').replace(/[^0-9]/g, '');
+      row.push(txt ? parseInt(txt, 10) : null);
+    }
+    results.push(row);
   }
-  results.push(row);
-}
-await worker.terminate();
-return results;
+  await worker.terminate();
+  return results;
 }
 
 window.bingo = {
 startCamera: async function (videoId) {
-  const v = document.getElementById(videoId);
-  const s = await navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode: { ideal: 'environment' },
-      width:  { ideal: 1920 },
-      height: { ideal: 1080 }
-    },
-    audio: false
-  });
-  v.srcObject = s;
-  await v.play();
+    const v = document.getElementById(videoId);
+    const s = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width:  { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    });
+    v.srcObject = s;
+    await v.play();
 
-  // Ensure metadata is ready so videoWidth/Height are valid
-  if (!v.videoWidth || !v.videoHeight) {
-    await new Promise(res => v.onloadedmetadata ? (v.onloadedmetadata = res) : setTimeout(res, 100));
-  }
+    // store track reference for torch toggle
+    _videoTrack = s.getVideoTracks()[0];
 
-  // Optional: enable torch if supported (won’t throw on iOS/older browsers)
-  try {
-    const track = s.getVideoTracks()[0];
-    if (track.getCapabilities) {
-      const caps = track.getCapabilities();
-      if ('torch' in caps) await track.applyConstraints({ advanced: [{ torch: true }] });
+    // ensure videoWidth/Height are ready
+    if (!v.videoWidth || !v.videoHeight) {
+      await new Promise(res => v.onloadedmetadata ? (v.onloadedmetadata = res) : setTimeout(res, 100));
     }
-  } catch {}
-  return true;
-},
+    return true;
+  },
+
+  // Runtime torch toggle (safe on devices without torch)
+  setTorch: async function(on){
+    try {
+      if (!_videoTrack || !_videoTrack.getCapabilities) return false;
+      const caps = _videoTrack.getCapabilities();
+      if (!('torch' in caps)) return false;
+      await _videoTrack.applyConstraints({ advanced: [{ torch: !!on }] });
+      return true;
+    } catch { return false; }
+  },
+
+  hasTorch: function(){
+    try { return !!(_videoTrack && _videoTrack.getCapabilities && ('torch' in _videoTrack.getCapabilities())); }
+    catch { return false; }
+  },
 
   stopCamera: function (videoId) {
     const v = document.getElementById(videoId);
     if (!v || !v.srcObject) return;
     v.srcObject.getTracks().forEach(t => t.stop());
     v.srcObject = null;
+    _videoTrack = null;
   },
 
   // Camera → OCR
-captureAndOcr: async function (videoId, canvasId, rows = 5, cols = 5) {
-  try { await ensureLibs(); } catch { alert('Could not load vision libraries.'); return null; }
-  const v = document.getElementById(videoId);
+captureAndOcr: async function (videoId, canvasId, rows=5, cols=5) {
+    try { await ensureLibs(); } catch { alert('Could not load vision libraries.'); return null; }
+    const v = document.getElementById(videoId);
 
-  // Give autofocus a moment, then grab the frame
-  await new Promise(r => setTimeout(r, 250));
+    // let autofocus settle
+    await new Promise(r => setTimeout(r, 250));
 
-  const c = getOrCreateCanvas(canvasId);
-  c.width = v.videoWidth || v.clientWidth;
-  c.height = v.videoHeight || v.clientHeight;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(v, 0, 0, c.width, c.height);
+    const c = getOrCreateCanvas(canvasId);
+    c.width = v.videoWidth || v.clientWidth;
+    c.height = v.videoHeight || v.clientHeight;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(v, 0, 0, c.width, c.height);
 
-  return await segmentAndOcr(c, rows, cols);
-},
+    return await segmentAndOcr(c, rows, cols);
+  },
 
   // File input → OCR
-  scanImage: async function(fileInputId, canvasId, rows=5, cols=5){
+ scanImage: async function(fileInputId, canvasId, rows=5, cols=5){
     try { await ensureLibs(); } catch { alert('Could not load vision libraries.'); return null; }
     const input = document.getElementById(fileInputId);
     if (!input?.files?.length) return null;
