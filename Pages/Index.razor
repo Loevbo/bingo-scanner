@@ -1,0 +1,263 @@
+@page "/"
+@using BingoScanner.Shared
+@using System.Linq
+@inject BingoScanner.Services.StorageService Storage
+@inject BingoScanner.Services.BingoPlateGenerator testgenerator
+@inject IJSRuntime JS
+
+<div class="max-w-3xl mx-auto p-6 space-y-4">
+  <h1 class="text-2xl font-bold">Bingo Scanner</h1>
+
+  <canvas id="proc" class="hidden"></canvas>
+
+  <div class="grid gap-4 md:grid-cols-2">
+    <div class="space-y-2">
+      @if (!cameraStarted)
+      {
+        <button class="px-4 py-2 rounded-xl bg-black text-white" @onclick="Start">Start Camera</button>
+        <input id="file" type="file" accept="image/*" class="border rounded-xl px-3 py-2" />
+        <button class="px-4 py-2 rounded-xl bg-indigo-600 text-white" @onclick="ScanFromImage">Scan Image</button>
+
+        <button class="px-4 py-2 rounded-xl bg-purple-600 text-white"
+        @onclick="() => GenerateTestPlates(30)">
+  Add 30 test plates
+</button>
+      }
+      else
+      {
+        <video id="cam" class="w-full rounded-xl shadow" playsinline></video>
+        <canvas id="frame" class="hidden"></canvas>
+        <div class="flex gap-2">
+          <button class="px-4 py-2 rounded-xl bg-slate-800 text-white" @onclick="Capture">Scan Plate</button>
+          <button class="px-4 py-2 rounded-xl bg-slate-500 text-white" @onclick="Stop">Stop Camera</button>
+        </div>
+      }
+    </div>
+
+    <div class="space-y-2">
+      <div class="flex items-end gap-2">
+        <!-- <input class="border rounded-xl px-3 py-2 w-full" placeholder="Called numbers comma-separated" @bind="calledRaw" /> -->
+        <input class="border rounded-xl px-3 py-2 w-24" type="number" min="1" @bind-value="wantCount" />
+        <button class="px-4 py-2 rounded-xl bg-emerald-600 text-white" @onclick="PickBest">Pick</button>
+      </div>
+
+      <div class="text-sm text-slate-600">Plates: @plates.Count</div>
+
+      @if (best.Any())
+        {
+        <div class="mt-4">
+<h2 class="font-semibold">
+  Best @wantCount
+  <span class="text-sm text-slate-600"  title="@MissingTooltip">— @coveredCount/90 numbers</span>
+</h2>
+
+            <div class="space-y-3">
+            @foreach (var p in best)
+            {
+                <div class="rounded-xl overflow-hidden border border-slate-300 bg-emerald-50">
+                <table class="w-full table-fixed border-collapse">
+                    @for (int r = 0; r < p.Cells.Length; r++)
+                    {
+                    <tr>
+                        @for (int c = 0; c < p.Cells[r].Length; c++)
+                        {
+                        var v = p.Cells[r][c];
+                        var hit = v.HasValue && called.Contains(v.Value);
+                        <td class="border border-slate-300 text-center py-1 @(hit ? "bg-emerald-200" : "")">
+                            @(v?.ToString() ?? "")
+                        </td>
+                        }
+                    </tr>
+                    }
+                </table>
+                </div>
+            }
+            </div>
+        </div>
+        }
+    </div>
+  </div>
+</div>
+
+@code {
+  List<Plate> plates = new();
+  List<Plate> best = new();
+  string calledRaw = string.Empty;
+  HashSet<int> called = new();
+  int wantCount = 1;
+  bool cameraStarted = false;
+  int uniqueCount = 0;
+int duplicateRepeats = 0;
+int coveredCount = 0;
+
+List<int> missingNumbers = new();
+
+  protected override async Task OnInitializedAsync()
+  {
+    plates = await Storage.LoadPlatesAsync();
+  }
+
+async Task GenerateTestPlates(int count)
+{
+    var generated = testgenerator.GenerateRandomPlates(count); // 3×9 plates
+    foreach (var cells in generated)
+        plates.Add(new Plate(Guid.NewGuid(), cells));
+
+    await Storage.SavePlatesAsync(plates);
+    StateHasChanged();
+}
+
+void UpdateBestStats()
+{
+    var seen = new HashSet<int>();
+    foreach (var p in best)
+        for (int r = 0; r < p.Cells.Length; r++)
+            for (int c = 0; c < p.Cells[r].Length; c++)
+                if (p.Cells[r][c].HasValue) seen.Add(p.Cells[r][c]!.Value);
+
+    coveredCount = seen.Count;
+    missingNumbers = Enumerable.Range(1, 90).Where(n => !seen.Contains(n)).ToList();
+}
+
+string MissingTooltip =>
+    missingNumbers.Count == 0
+        ? "All numbers covered"
+        : "Missing: " + FormatRanges(missingNumbers);
+
+
+string FormatRanges(List<int> nums)
+{
+    if (nums.Count == 0) return "";
+    nums.Sort();
+    var ranges = new List<string>();
+    int start = nums[0], prev = nums[0];
+    for (int i = 1; i < nums.Count; i++)
+    {
+        if (nums[i] == prev + 1) { prev = nums[i]; continue; }
+        ranges.Add(start == prev ? $"{start}" : $"{start}–{prev}");
+        start = prev = nums[i];
+    }
+    ranges.Add(start == prev ? $"{start}" : $"{start}–{prev}");
+    return string.Join(", ", ranges);
+}
+
+async Task ScanFromImage()
+{
+var arr = await JS.InvokeAsync<int?[][]>("bingo.scanImage", "file", "proc", 3, 9);
+  if (arr == null) return;
+  var plate = new Plate(Guid.NewGuid(), arr);
+  plates.Insert(0, plate);
+  await Storage.SavePlatesAsync(plates);
+}
+
+  async Task Start()
+  {
+    // Ensure the <video id="cam"> exists before calling JS
+    cameraStarted = true;
+    StateHasChanged();
+    await Task.Yield(); // let the DOM update
+    await JS.InvokeVoidAsync("bingo.startCamera", "cam");
+  }
+
+  void Remove(Guid id)
+{
+    plates = plates.Where(p => p.Id != id).ToList();
+    Storage.SavePlatesAsync(plates);
+    best = best.Where(p => p.Id != id).ToList(); // keep Best view consistent
+    StateHasChanged();
+}
+
+  async Task Stop()
+  {
+    await JS.InvokeVoidAsync("bingo.stopCamera", "cam");
+    cameraStarted = false;
+  }
+
+  async Task Capture()
+  {
+    var arr = await JS.InvokeAsync<int?[][]>("bingo.captureAndOcr", "cam", "frame");
+    if (arr == null) return;
+    var plate = new Plate(Guid.NewGuid(), arr);
+    plates.Insert(0, plate);
+    await Storage.SavePlatesAsync(plates);
+    StateHasChanged();
+  }
+
+  void ParseCalled()
+  {
+    called = calledRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+      .Select(s => int.TryParse(s, out var n) ? n : (int?)null)
+      .Where(n => n.HasValue)
+      .Select(n => n!.Value)
+      .ToHashSet();
+  }
+
+  void PickBest()
+{
+    ParseCalled(); // if you want called numbers to influence the choice; leave it if you’re typing called numbers
+    var k = Math.Clamp(wantCount, 1, Math.Max(1, plates.Count));
+
+    var remaining = plates.ToList();
+    var picked = new List<Plate>();
+    var covered = new HashSet<int>();
+
+    while (picked.Count < k && remaining.Count > 0)
+    {
+        Plate? bestPlate = null;
+        int bestNew = -1;
+        int bestOverlap = int.MaxValue;
+        int bestTotal = -1;
+
+        foreach (var p in remaining)
+        {
+            var nums = GetPlateNumbers(p);
+            nums = FilterToCalled(nums); // if no called numbers are entered, this is just nums
+
+            int newAdds = nums.Count(n => !covered.Contains(n));
+            int overlap = nums.Count(n => covered.Contains(n));
+            int total = nums.Count;
+
+            if (newAdds > bestNew ||
+               (newAdds == bestNew && overlap < bestOverlap) ||
+               (newAdds == bestNew && overlap == bestOverlap && total > bestTotal))
+            {
+                bestPlate = p;
+                bestNew = newAdds;
+                bestOverlap = overlap;
+                bestTotal = total;
+            }
+        }
+
+        if (bestPlate is null) break;
+
+        picked.Add(bestPlate);
+
+        var chosenNums = FilterToCalled(GetPlateNumbers(bestPlate));
+        foreach (var n in chosenNums) covered.Add(n);
+
+        remaining.Remove(bestPlate);
+    }
+
+    best = picked;
+    UpdateBestStats();
+}
+
+
+
+
+
+static HashSet<int> GetPlateNumbers(Plate p)
+{
+    var set = new HashSet<int>();
+    for (int r = 0; r < p.Cells.Length; r++)
+        for (int c = 0; c < p.Cells[r].Length; c++)
+            if (p.Cells[r][c].HasValue) set.Add(p.Cells[r][c]!.Value);
+    return set;
+}
+
+HashSet<int> FilterToCalled(HashSet<int> nums)
+{
+    if (called is null || called.Count == 0) return nums;
+    return nums.Where(n => called.Contains(n)).ToHashSet();
+}
+}
