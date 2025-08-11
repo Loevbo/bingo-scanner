@@ -175,7 +175,7 @@ var arr = await JS.InvokeAsync<int?[][]>("bingo.scanImage", "file", "proc", 3, 9
 
   async Task Capture()
   {
-    var arr = await JS.InvokeAsync<int?[][]>("bingo.captureAndOcr", "cam", "frame");
+    var arr = await JS.InvokeAsync<int?[][]>("bingo.captureAndOcr", "cam", "proc", 3, 9);
     if (arr == null) return;
     var plate = new Plate(Guid.NewGuid(), arr);
     plates.Insert(0, plate);

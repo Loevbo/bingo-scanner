@@ -114,70 +114,104 @@ async function segmentAndOcr(canvasEl, rows, cols){
 
   // Binarize (Otsu) for clearer digits
   const gray = new cv.Mat();
-  cv.cvtColor(gridMat, gray, cv.COLOR_RGBA2GRAY);
-  const bw = new cv.Mat();
-  cv.threshold(gray, bw, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-  gray.delete();
+cv.cvtColor(gridMat, gray, cv.COLOR_RGBA2GRAY);
+const den = new cv.Mat();
+cv.medianBlur(gray, den, 3);               // less blur than Gaussian, preserves edges
+const bw = new cv.Mat();
+cv.threshold(den, bw, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+gray.delete(); den.delete();
 
-  const cellW = Math.floor(bw.cols / cols);
-  const cellH = Math.floor(bw.rows / rows);
+// ---- per-cell crop (bigger padding so grid lines never leak in) ----
+const cellW = Math.floor(bw.cols / cols);
+const cellH = Math.floor(bw.rows / rows);
+const padXf = (rows === 3 && cols === 9) ? 0.18 : 0.14;
+const padYf = (rows === 3 && cols === 9) ? 0.14 : 0.12;
 
-  // Tuned padding; smaller for 3×9 (digits are larger & lower)
-  const basePadX = rows === 3 && cols === 9 ? 0.10 : 0.12;
-  const basePadY = rows === 3 && cols === 9 ? 0.08 : 0.10;
+const images = [];
+for (let r=0; r<rows; r++){
+  const rowImgs = [];
+  for (let c=0; c<cols; c++){
+    const x = c * cellW, y = r * cellH;
+    const padX = Math.floor(cellW * padXf);
+    const padY = Math.floor(cellH * padYf);
 
-  const images = [];
-  for (let r=0; r<rows; r++){
-    const rowImgs = [];
-    for (let c=0; c<cols; c++){
-      const x = c * cellW;
-      const y = r * cellH;
+    // nudge last row a little lower for 3×9 tickets
+    const extraY = (rows === 3 && cols === 9 && r === rows-1) ? Math.floor(padY * 0.5) : 0;
 
-      let padX = Math.floor(cellW * basePadX);
-      let padY = Math.floor(cellH * basePadY);
+    const rx = Math.max(0, x + padX);
+    const ry = Math.max(0, y + padY + extraY);
+    const rw = Math.max(1, Math.min(cellW - 2*padX, bw.cols - rx));
+    const rh = Math.max(1, Math.min(cellH - 2*padY - extraY, bw.rows - ry));
 
-      // Nudge last row slightly downward on 3×9 tickets (digits sit lower)
-      let ry = y + padY + ((rows === 3 && cols === 9 && r === rows - 1) ? Math.floor(padY * 0.5) : 0);
-      let rx = x + padX;
+    const digit = bw.roi(new cv.Rect(rx, ry, rw, rh));
 
-      const rw = Math.max(1, Math.min(cellW - 2*padX, bw.cols - rx));
-      const rh = Math.max(1, Math.min(cellH - 2*padY, bw.rows - ry));
+    // upscale ROI to help OCR (camera often ~1–2 MP)
+    const scaled = new cv.Mat();
+    const target = 120; // px
+    const scaleW = target, scaleH = Math.round((target * rh) / rw);
+    cv.resize(digit, scaled, new cv.Size(scaleW, scaleH), 0, 0, cv.INTER_CUBIC);
 
-      const digit = bw.roi(new cv.Rect(rx, ry, rw, rh));
-      const tmp = document.createElement('canvas');
-      cv.imshow(tmp, digit);
-      rowImgs.push(tmp.toDataURL('image/png'));
-      digit.delete();
-    }
-    images.push(rowImgs);
+    const tmp = document.createElement('canvas');
+    cv.imshow(tmp, scaled);
+    rowImgs.push(tmp.toDataURL('image/png'));
+
+    digit.delete(); scaled.delete();
   }
+  images.push(rowImgs);
+}
+bw.delete(); gridMat.delete();
 
-  bw.delete();
-  gridMat.delete();
+// ---- OCR with numeric mode + single line psm ----
+const worker = await Tesseract.createWorker('eng');
+await worker.setParameters({
+  tessedit_char_whitelist: '0123456789',
+  classify_bln_numeric_mode: '1',
+  tessedit_pageseg_mode: '7' // treat ROI as a single text line
+});
 
-  const worker = await Tesseract.createWorker('eng');
-  const results = [];
-  for (let r=0; r<rows; r++){
-    const row = [];
-    for (let c=0; c<cols; c++){
-      const { data } = await worker.recognize(images[r][c], { tessedit_char_whitelist: '0123456789' });
-      const txt = (data.text || '').replace(/[^0-9]/g,'');
-      row.push(txt ? parseInt(txt, 10) : null);
-    }
-    results.push(row);
+const results = [];
+for (let r=0; r<rows; r++){
+  const row = [];
+  for (let c=0; c<cols; c++){
+    const { data } = await worker.recognize(images[r][c]);
+    const txt = (data.text || '').replace(/[^0-9]/g, '');
+    row.push(txt ? parseInt(txt, 10) : null);
   }
-  await worker.terminate();
-  return results;
+  results.push(row);
+}
+await worker.terminate();
+return results;
 }
 
 window.bingo = {
-  startCamera: async function (videoId) {
-    const v = document.getElementById(videoId);
-    const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-    v.srcObject = s;
-    await v.play();
-    return true;
-  },
+startCamera: async function (videoId) {
+  const v = document.getElementById(videoId);
+  const s = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: { ideal: 'environment' },
+      width:  { ideal: 1920 },
+      height: { ideal: 1080 }
+    },
+    audio: false
+  });
+  v.srcObject = s;
+  await v.play();
+
+  // Ensure metadata is ready so videoWidth/Height are valid
+  if (!v.videoWidth || !v.videoHeight) {
+    await new Promise(res => v.onloadedmetadata ? (v.onloadedmetadata = res) : setTimeout(res, 100));
+  }
+
+  // Optional: enable torch if supported (won’t throw on iOS/older browsers)
+  try {
+    const track = s.getVideoTracks()[0];
+    if (track.getCapabilities) {
+      const caps = track.getCapabilities();
+      if ('torch' in caps) await track.applyConstraints({ advanced: [{ torch: true }] });
+    }
+  } catch {}
+  return true;
+},
 
   stopCamera: function (videoId) {
     const v = document.getElementById(videoId);
@@ -187,14 +221,21 @@ window.bingo = {
   },
 
   // Camera → OCR
-  captureAndOcr: async function (videoId, canvasId, rows=5, cols=5) {
-    try { await ensureLibs(); } catch { alert('Could not load vision libraries.'); return null; }
-    const v = document.getElementById(videoId);
-    const c = getOrCreateCanvas(canvasId);
-    c.width = v.videoWidth; c.height = v.videoHeight;
-    c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
-    return await segmentAndOcr(c, rows, cols);
-  },
+captureAndOcr: async function (videoId, canvasId, rows = 5, cols = 5) {
+  try { await ensureLibs(); } catch { alert('Could not load vision libraries.'); return null; }
+  const v = document.getElementById(videoId);
+
+  // Give autofocus a moment, then grab the frame
+  await new Promise(r => setTimeout(r, 250));
+
+  const c = getOrCreateCanvas(canvasId);
+  c.width = v.videoWidth || v.clientWidth;
+  c.height = v.videoHeight || v.clientHeight;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(v, 0, 0, c.width, c.height);
+
+  return await segmentAndOcr(c, rows, cols);
+},
 
   // File input → OCR
   scanImage: async function(fileInputId, canvasId, rows=5, cols=5){
